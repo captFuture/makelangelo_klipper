@@ -316,4 +316,5 @@ class PolarDrawingKinematics:
 
 def load_kinematics(toolhead, config):
     """Entry point called by Klipper when 'kinematics: polardrawing' is set."""
-    return PolarDrawingKinematics(toolhead, config)
+    # config here is the [printer] section -- we need the [polardrawing] section
+    return PolarDrawingKinematics(toolhead, config.getsection('polardrawing'))
