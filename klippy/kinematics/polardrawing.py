@@ -1,9 +1,5 @@
 # Polar Drawing Machine Kinematics for Klipper
 # Repository: https://github.com/captFuture/makelangelo_klipper
-#
-# Based on winch.py pattern -- each motor is a cable winch at a fixed anchor.
-# winch_stepper_alloc(ax, ay, az) computes belt length as Euclidean distance
-# from anchor to toolhead position -- exactly the polargraph belt formula.
 
 import math
 import logging
@@ -44,7 +40,7 @@ class PolarDrawingKinematics:
         self.homed_drawing_x = 0.0              - draw_origin_wx
         self.homed_drawing_y = self.home_y_world - draw_origin_wy
 
-        # ── Load steppers (winch.py pattern) ─────────────────────────────────
+        # ── Load steppers ─────────────────────────────────────────────────────
         self.steppers = []
         anchors = [self.anchor_left, self.anchor_right]
         for name, anchor in zip(['stepper_left', 'stepper_right'], anchors):
@@ -65,9 +61,15 @@ class PolarDrawingKinematics:
 
         self.homing_speed_cfg = config.getfloat('homing_speed', 50.0)
 
-        # ── Drawing area for Mainsail ─────────────────────────────────────────
-        self.axes_min = toolhead.Coord([0., 0., 0., 0.])
-        self.axes_max = toolhead.Coord([self.draw_width, self.draw_height, 0., 0.])
+        # ── Movement bounds for Mainsail / Klipper ────────────────────────────
+        # FIX: We must allow the machine to move down to the homed position!
+        limit_x_min = -self.draw_margin_left - 100.0
+        limit_x_max = self.motor_distance + 100.0
+        limit_y_min = -self.draw_margin_top - 10.0
+        limit_y_max = self.homed_drawing_y + 50.0
+        
+        self.axes_min = toolhead.Coord([limit_x_min, limit_y_min, 0., 0.])
+        self.axes_max = toolhead.Coord([limit_x_max, limit_y_max, 0., 0.])
 
         # ── Pen changer placeholder ───────────────────────────────────────────
         self._init_pen_changer(config)
@@ -88,11 +90,6 @@ class PolarDrawingKinematics:
         self.current_pen         = 0
         self.pen_changer_enabled = (self.pen_changer_angle_pin is not None
                                     and self.pen_changer_servo_pin is not None)
-
-    def _do_pen_change(self, target_pen):
-        logging.info("PolarDrawing: pen change %d->%d (NOT YET IMPLEMENTED)",
-                     self.current_pen, target_pen)
-        self.current_pen = target_pen
 
     def get_steppers(self):
         return list(self.steppers)
@@ -121,8 +118,6 @@ class PolarDrawingKinematics:
         from extras import homing as homing_mod
         toolhead = self.printer.lookup_object('toolhead')
 
-        curpos = list(toolhead.get_position())
-
         hmove = homing_mod.HomingMove(self.printer, self.endstops)
         homepos = [self.homed_drawing_x, self.homed_drawing_y, 0., 0.]
         forcepos = [self.homed_drawing_x,
@@ -140,13 +135,12 @@ class PolarDrawingKinematics:
         pass
 
     def check_move(self, move):
+        # FIX: Only prevent moving "above" the motors.
+        # Belt length limits (position_min/max in stepper config) handle the rest safely.
         dx, dy = move.end_pos[0], move.end_pos[1]
-        if (dx < 0. or dx > self.draw_width or
-                dy < 0. or dy > self.draw_height):
+        if dy < -self.draw_margin_top:
             raise move.move_error(
-                "PolarDrawing: (%.2f, %.2f) outside drawing area "
-                "X=[0, %.0f] Y=[0, %.0f]"
-                % (dx, dy, self.draw_width, self.draw_height))
+                "PolarDrawing: Target Y (%.2f) is above the motors. Move denied." % dy)
 
     def get_status(self, eventtime):
         return {
