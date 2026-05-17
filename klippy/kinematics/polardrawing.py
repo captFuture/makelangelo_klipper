@@ -9,26 +9,20 @@ class PolarDrawingKinematics:
     def __init__(self, toolhead, config):
         self.printer = config.get_printer()
 
-        # ── Machine dimensions ────────────────────────────────────────────────
         self.motor_distance   = config.getfloat('motor_distance', above=0.)
         self.hypotenuse_home  = config.getfloat('hypotenuse_length_at_home', 1035.0)
         self.max_belt_length  = config.getfloat('max_belt_length', 1400.0)
         self.min_belt_length  = config.getfloat('min_belt_length', 100.0)
         self.draw_margin_left = config.getfloat('draw_margin_left', 115.0)
-        self.draw_margin_top  = config.getfloat('draw_margin_top',  115.0)
+        self.draw_margin_top  = config.getfloat('draw_margin_top',  150.0)
         self.draw_width       = config.getfloat('draw_width',  594.0)
         self.draw_height      = config.getfloat('draw_height', 420.0)
         self.homing_speed     = config.getfloat('homing_speed', 50.0)
 
-        # ── Derived geometry ──────────────────────────────────────────────────
         half_w = self.motor_distance / 2.0
 
-        self.anchor_left  = (-self.draw_margin_left,
-                              0.,
-                             -self.draw_margin_top)
-        self.anchor_right = (self.motor_distance - self.draw_margin_left,
-                              0.,
-                             -self.draw_margin_top)
+        self.anchor_left  = (-self.draw_margin_left, 0., -self.draw_margin_top)
+        self.anchor_right = (self.motor_distance - self.draw_margin_left, 0., -self.draw_margin_top)
 
         self.home_y_world    = math.sqrt(
             max(self.hypotenuse_home**2 - half_w**2, 0.0))
@@ -38,7 +32,6 @@ class PolarDrawingKinematics:
         self.homed_drawing_x = 0.0              - draw_origin_wx
         self.homed_drawing_y = self.home_y_world - draw_origin_wy
 
-        # ── Load steppers ─────────────────────────────────────────────────────
         self.steppers = []
         anchors = [self.anchor_left, self.anchor_right]
         for name, anchor in zip(['stepper_left', 'stepper_right'], anchors):
@@ -47,7 +40,6 @@ class PolarDrawingKinematics:
             s.set_trapq(toolhead.get_trapq())
             self.steppers.append(s)
 
-        # ── Endstops ──────────────────────────────────────────────────────────
         ppins = self.printer.lookup_object('pins')
         self.endstops = []
         for i, name in enumerate(['stepper_left', 'stepper_right']):
@@ -108,10 +100,11 @@ class PolarDrawingKinematics:
         hmove = homing_mod.HomingMove(self.printer, self.endstops)
         homepos = [self.homed_drawing_x, self.homed_drawing_y, 0., 0.]
         
-        # BEREINIGTE LOGIK: Homing muss den Riemen mathematisch verlängern, 
-        # also zwingen wir den Startpunkt HÖHER als den Zielpunkt!
+        # PERFEKTE LOGIK: Wir zwingen Klipper zu glauben, die Gondel ist 
+        # ganz oben (1mm unter den Motoren = kürzester Gurt).
+        # Die Fahrt zu "homepos" nutzt nun in eine Richtung die gesamte physische Gurtlänge.
         forcepos = [self.homed_drawing_x,
-                    self.homed_drawing_y - self.draw_height,
+                    -self.draw_margin_top + 1.0,
                     0., 0.]
         toolhead.set_position(forcepos)
         hmove.homing_move(homepos, self.homing_speed)
