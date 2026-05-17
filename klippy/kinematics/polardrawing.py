@@ -1,3 +1,4 @@
+
 # Polar Drawing Machine Kinematics for Klipper
 # Repository: https://github.com/captFuture/makelangelo_klipper
 
@@ -10,13 +11,13 @@ class PolarDrawingKinematics:
         self.printer = config.get_printer()
 
         self.motor_distance   = config.getfloat('motor_distance', above=0.)
-        self.hypotenuse_home  = config.getfloat('hypotenuse_length_at_home', 1035.0)
-        self.max_belt_length  = config.getfloat('max_belt_length', 1400.0)
+        self.hypotenuse_home  = config.getfloat('hypotenuse_length_at_home', 1060.0)
+        self.max_belt_length  = config.getfloat('max_belt_length', 1450.0)
         self.min_belt_length  = config.getfloat('min_belt_length', 100.0)
         self.draw_margin_left = config.getfloat('draw_margin_left', 115.0)
         self.draw_margin_top  = config.getfloat('draw_margin_top',  150.0)
-        self.draw_width       = config.getfloat('draw_width',  594.0)
-        self.draw_height      = config.getfloat('draw_height', 420.0)
+        self.draw_width       = config.getfloat('draw_width',  420.0)
+        self.draw_height      = config.getfloat('draw_height', 594.0)
         self.homing_speed     = config.getfloat('homing_speed', 50.0)
 
         half_w = self.motor_distance / 2.0
@@ -98,17 +99,21 @@ class PolarDrawingKinematics:
         toolhead = self.printer.lookup_object('toolhead')
 
         hmove = homing_mod.HomingMove(self.printer, self.endstops)
-        homepos = [self.homed_drawing_x, self.homed_drawing_y, 0., 0.]
         
-        # PERFEKTE LOGIK: Wir zwingen Klipper zu glauben, die Gondel ist 
-        # ganz oben (1mm unter den Motoren = kürzester Gurt).
-        # Die Fahrt zu "homepos" nutzt nun in eine Richtung die gesamte physische Gurtlänge.
+        # FIX: Wir simulieren einen extrem tiefen Zielpunkt (+ 2000 mm), 
+        # damit Klipper mehr als genug Gurtstrecke generiert, um die Endstops 
+        # aus jeder denkbaren Position zu erreichen.
+        fake_target = [self.homed_drawing_x, self.homed_drawing_y + 2000.0, 0., 0.]
+        
         forcepos = [self.homed_drawing_x,
                     -self.draw_margin_top + 1.0,
                     0., 0.]
         toolhead.set_position(forcepos)
-        hmove.homing_move(homepos, self.homing_speed)
+        
+        # Führe Homing aus (wird durch die Endstops unterbrochen)
+        hmove.homing_move(fake_target, self.homing_speed)
 
+        # Sobald die Endstops klicken, ignoriere den Fake-Target und setze den echten Nullpunkt
         homing_state.set_homed_position(
             [self.homed_drawing_x, self.homed_drawing_y, 0.])
         logging.info("PolarDrawing: homing done, drawing pos=(%.2f, %.2f)",
