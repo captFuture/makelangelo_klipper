@@ -116,13 +116,23 @@ class PolarDrawingKinematics:
         self.homed_drawing_y =  self.home_y_world - self.draw_origin_wy
 
         # ── Load belt steppers ────────────────────────────────────────────────
+        # Klipper v0.13+ API:
+        #   - setup_itersolve connects the stepper to the C iterative solver
+        #     'cartesian_stepper_alloc' with axis 'x' or 'y' gives a linear
+        #     stepper that moves proportionally -- we override calc_position
+        #     and set_position so the axis letter doesn't matter functionally,
+        #     but a valid solver must be provided.
+        #   - set_trapq connects the stepper to the toolhead motion queue.
+        #   - register_step_generator was removed in v0.13; set_trapq replaces it.
 
         self.steppers = []
-        for name in ['stepper_left', 'stepper_right']:
+        trapq = toolhead.get_trapq()
+        for name, axis in [('stepper_left', b'x'), ('stepper_right', b'y')]:
             s = stepper.PrinterStepper(config.getsection(name),
                                        units_in_radians=False)
+            s.setup_itersolve('cartesian_stepper_alloc', axis)
+            s.set_trapq(trapq)
             self.steppers.append(s)
-            toolhead.register_step_generator(s.generate_steps)
 
         # ── Pen changer placeholder ───────────────────────────────────────────
         self._init_pen_changer(config)
