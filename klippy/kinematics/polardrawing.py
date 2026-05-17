@@ -30,13 +30,11 @@ class PolarDrawingKinematics:
                               0.,
                              -self.draw_margin_top)
 
-        # Gondola world-Y when both endstops trigger
         self.home_y_world    = math.sqrt(
             max(self.hypotenuse_home**2 - half_w**2, 0.0))
-        # Drawing origin in world: (-half_w + draw_margin_left, draw_margin_top)
         draw_origin_wx = -half_w + self.draw_margin_left
         draw_origin_wy =  self.draw_margin_top
-        # Gondola drawing position after homing (world X=0, world Y=home_y_world)
+        
         self.homed_drawing_x = 0.0              - draw_origin_wx
         self.homed_drawing_y = self.home_y_world - draw_origin_wy
 
@@ -61,8 +59,6 @@ class PolarDrawingKinematics:
 
         self.homing_speed_cfg = config.getfloat('homing_speed', 50.0)
 
-        # ── Movement bounds for Mainsail / Klipper ────────────────────────────
-        # FIX: We must allow the machine to move down to the homed position!
         limit_x_min = -self.draw_margin_left - 100.0
         limit_x_max = self.motor_distance + 100.0
         limit_y_min = -self.draw_margin_top - 10.0
@@ -71,17 +67,8 @@ class PolarDrawingKinematics:
         self.axes_min = toolhead.Coord([limit_x_min, limit_y_min, 0., 0.])
         self.axes_max = toolhead.Coord([limit_x_max, limit_y_max, 0., 0.])
 
-        # ── Pen changer placeholder ───────────────────────────────────────────
         self._init_pen_changer(config)
         self.printer.add_object('polardrawing', self)
-
-        logging.info(
-            "PolarDrawing: motor_distance=%.1f  hypotenuse_home=%.1f  "
-            "home_y_world=%.1f  homed_drawing=(%.1f, %.1f)  "
-            "anchors: left=%s  right=%s",
-            self.motor_distance, self.hypotenuse_home,
-            self.home_y_world, self.homed_drawing_x, self.homed_drawing_y,
-            self.anchor_left, self.anchor_right)
 
     def _init_pen_changer(self, config):
         self.pen_changer_angle_pin = config.get('pen_changer_angle_sensor_pin', None)
@@ -120,8 +107,11 @@ class PolarDrawingKinematics:
 
         hmove = homing_mod.HomingMove(self.printer, self.endstops)
         homepos = [self.homed_drawing_x, self.homed_drawing_y, 0., 0.]
+        
+        # BEREINIGTE LOGIK: Homing muss den Riemen mathematisch verlängern, 
+        # also zwingen wir den Startpunkt HÖHER als den Zielpunkt!
         forcepos = [self.homed_drawing_x,
-                    self.homed_drawing_y + self.draw_height,
+                    self.homed_drawing_y - self.draw_height,
                     0., 0.]
         toolhead.set_position(forcepos)
         hmove.homing_move(homepos, self.homing_speed)
@@ -135,8 +125,6 @@ class PolarDrawingKinematics:
         pass
 
     def check_move(self, move):
-        # FIX: Only prevent moving "above" the motors.
-        # Belt length limits (position_min/max in stepper config) handle the rest safely.
         dx, dy = move.end_pos[0], move.end_pos[1]
         if dy < -self.draw_margin_top:
             raise move.move_error(
@@ -147,11 +135,6 @@ class PolarDrawingKinematics:
             'homed_axes':          'xy',
             'axis_minimum':        self.axes_min,
             'axis_maximum':        self.axes_max,
-            'motor_distance':      self.motor_distance,
-            'hypotenuse_home':     self.hypotenuse_home,
-            'home_y_world':        self.home_y_world,
-            'draw_origin_wx':      self.anchor_left[0],
-            'draw_origin_wy':      -self.anchor_left[2],
             'homed_drawing_x':     self.homed_drawing_x,
             'homed_drawing_y':     self.homed_drawing_y,
             'draw_width':          self.draw_width,
