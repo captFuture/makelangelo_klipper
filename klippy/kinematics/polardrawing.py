@@ -120,6 +120,10 @@ class PolarDrawingKinematics:
         # ── Pen changer placeholder ───────────────────────────────────────────
         self._init_pen_changer(config)
 
+        # Register as a printer object so macros can access
+        # printer['polardrawing'].motor_distance etc.
+        self.printer.add_object('polardrawing', self)
+
         logging.info(
             "PolarDrawing: motor_distance=%.1f  hypotenuse_home=%.1f  "
             "draw_origin_world=(%.1f, %.1f)  home_y_world=%.1f  "
@@ -242,6 +246,11 @@ class PolarDrawingKinematics:
 
     def check_move(self, move):
         """Reject moves outside drawing area or beyond belt length limits."""
+        # Skip bounds check if not yet homed -- homing moves use raw belt
+        # coordinates which are outside the drawing area by definition.
+        if self.limits[0][0] > self.limits[0][1]:
+            return  # not homed, allow all moves
+
         dx, dy = move.end_pos[0], move.end_pos[1]
 
         if (dx < 0.0 or dx > self.draw_width or
