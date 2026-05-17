@@ -1,24 +1,21 @@
 # Polar Drawing Machine Kinematics for Klipper
 # Repository: https://github.com/captFuture/makelangelo_klipper
 #
-# Each stepper position = belt length in mm.
-# Klipper moves both steppers together; we override calc_position
-# and set_position to handle the polargraph math in Python.
-# The C solver (cartesian x) is used only for step generation --
-# it never sees actual XY coordinates, only belt lengths.
+# Architecture:
+#   stepper_left  uses cartesian_stepper_alloc('x') -- position[0] = left belt mm
+#   stepper_right uses cartesian_stepper_alloc('y') -- position[1] = right belt mm
 #
-# Coordinate systems:
-#   WORLD: origin at midpoint between motors on motor axis, Y increases down
-#   DRAWING: origin at (draw_margin_left right of left motor,
-#                       draw_margin_top  below motor axis)
-#            X right, Y down -- matches Makelangelo software convention
+#   The C solver moves steppers linearly in their axis.
+#   set_position() receives drawing coords and converts to belt lengths.
+#   calc_position() receives belt lengths and converts to drawing coords.
+#   home_rails() forcepos/homepos must be in belt-length space:
+#     [left_belt, right_belt, 0, 0]
 #
 # Homing:
-#   Both motors drive simultaneously toward longer belt (positive direction).
-#   Longer belt = gondola descends = counterweight rises to MAX endstop.
-#   position_endstop = hypotenuse_length_at_home = belt length at endstop.
-#   homing_positive_dir: true in both stepper configs.
-#   homing_retract_dist: 0 (retract handled by G28 macro instead).
+#   forcepos = [position_min, position_min, 0, 0]  (short belts)
+#   homepos  = [position_endstop, position_endstop, 0, 0]  (hypotenuse_home)
+#   homing_positive_dir: true -- drives from short to long belt
+#   Longer belt = gondola down = counterweight UP to MAX endstop
 #
 # Pen changer: placeholder for future carousel hardware.
 
@@ -32,14 +29,10 @@ class PolarDrawingKinematics:
         self.printer = config.get_printer()
 
         # ── Machine dimensions ────────────────────────────────────────────────
-
         self.motor_distance  = config.getfloat('motor_distance', above=0.)
         self.hypotenuse_home = config.getfloat('hypotenuse_length_at_home', 1035.0)
         self.max_belt_length = config.getfloat('max_belt_length', 1400.0)
         self.min_belt_length = config.getfloat('min_belt_length', 100.0)
-
-        # ── Drawing origin ────────────────────────────────────────────────────
-
         self.draw_margin_left = config.getfloat('draw_margin_left', 115.0)
         self.draw_margin_top  = config.getfloat('draw_margin_top',  115.0)
         self.draw_width       = config.getfloat('draw_width',  594.0)
@@ -47,42 +40,31 @@ class PolarDrawingKinematics:
         self.homing_speed     = config.getfloat('homing_speed', 50.0)
 
         # ── Derived geometry ──────────────────────────────────────────────────
-
         half_w = self.motor_distance / 2.0
-        # Drawing origin in world coordinates
-        self.draw_origin_wx = -half_w + self.draw_margin_left
-        self.draw_origin_wy =  self.draw_margin_top
-        # World Y of gondola when both endstops trigger
-        self.home_y_world   = math.sqrt(
+        self.draw_origin_wx  = -half_w + self.draw_margin_left
+        self.draw_origin_wy  =  self.draw_margin_top
+        self.home_y_world    = math.sqrt(
             max(self.hypotenuse_home**2 - half_w**2, 0.0))
-        # Gondola position in DRAWING coordinates after homing
-        self.homed_drawing_x = 0.0             - self.draw_origin_wx
+        self.homed_drawing_x = 0.0              - self.draw_origin_wx
         self.homed_drawing_y = self.home_y_world - self.draw_origin_wy
 
         # ── Load rails ────────────────────────────────────────────────────────
-        # stepper position = belt length in mm
-        # cartesian_stepper_alloc with 'x' is used only for step generation;
-        # all coordinate math is done in Python (calc_position / set_position).
-
+        # stepper_left  -> axis 'x' -> toolhead position[0] = left belt length
+        # stepper_right -> axis 'y' -> toolhead position[1] = right belt length
         self.rails = [
             stepper.LookupMultiRail(config.getsection('stepper_left')),
             stepper.LookupMultiRail(config.getsection('stepper_right')),
         ]
-        for rail, axis in zip(self.rails, [b'x', b'y']):
-            rail.setup_itersolve('cartesian_stepper_alloc', axis)
+        self.rails[0].setup_itersolve('cartesian_stepper_alloc', b'x')
+        self.rails[1].setup_itersolve('cartesian_stepper_alloc', b'y')
         for s in self.get_steppers():
             s.set_trapq(toolhead.get_trapq())
 
         self.is_homing = False
-
-        # Drawing area for Mainsail display
         self.axes_min = toolhead.Coord([0., 0., 0., 0.])
         self.axes_max = toolhead.Coord([self.draw_width, self.draw_height, 0., 0.])
 
-        # ── Pen changer placeholder ───────────────────────────────────────────
         self._init_pen_changer(config)
-
-        # Register so macros can access printer['polardrawing'].xxx
         self.printer.add_object('polardrawing', self)
 
         logging.info(
@@ -96,43 +78,31 @@ class PolarDrawingKinematics:
     # ── Pen changer placeholder ───────────────────────────────────────────────
 
     def _init_pen_changer(self, config):
-        """
-        Future hardware:
-          pen_changer_angle_sensor_pin -- ADC/encoder for carousel position
-          pen_changer_servo_pin        -- 360-deg continuous rotation servo
-        All keys are optional; omit to disable.
-        """
         self.pen_changer_angle_pin = config.get('pen_changer_angle_sensor_pin', None)
         self.pen_changer_servo_pin = config.get('pen_changer_servo_pin', None)
-        self.pen_count             = config.getint('pen_count', 4, minval=1)
-        self.current_pen           = 0
-        self.pen_changer_enabled   = (self.pen_changer_angle_pin is not None
-                                      and self.pen_changer_servo_pin is not None)
+        self.pen_count           = config.getint('pen_count', 4, minval=1)
+        self.current_pen         = 0
+        self.pen_changer_enabled = (self.pen_changer_angle_pin is not None
+                                    and self.pen_changer_servo_pin is not None)
 
     def _do_pen_change(self, target_pen):
-        """
-        PLACEHOLDER: rotate carousel to target_pen slot.
-        Implement when angle sensor and servo are fitted.
-        """
-        logging.info("PolarDrawing: pen change %d -> %d (NOT YET IMPLEMENTED)",
+        logging.info("PolarDrawing: pen change %d->%d (NOT YET IMPLEMENTED)",
                      self.current_pen, target_pen)
         self.current_pen = target_pen
 
-    # ── Inverse kinematics: drawing XY -> belt lengths ────────────────────────
+    # ── Kinematics math ───────────────────────────────────────────────────────
 
     def _xy_to_belts(self, dx, dy):
-        """Convert drawing position to (left_belt_mm, right_belt_mm)."""
-        wx     = self.draw_origin_wx + dx
-        wy     = self.draw_origin_wy + dy
-        half_w = self.motor_distance / 2.0
+        """Drawing coords -> (left_belt_mm, right_belt_mm)."""
+        wx      = self.draw_origin_wx + dx
+        wy      = self.draw_origin_wy + dy
+        half_w  = self.motor_distance / 2.0
         left_l  = math.sqrt((wx + half_w)**2 + wy**2)
         right_l = math.sqrt((wx - half_w)**2 + wy**2)
         return left_l, right_l
 
-    # ── Forward kinematics: belt lengths -> drawing XY ────────────────────────
-
     def _belts_to_xy(self, left_l, right_l):
-        """Convert (left_belt_mm, right_belt_mm) to drawing position."""
+        """(left_belt_mm, right_belt_mm) -> drawing coords."""
         W           = self.motor_distance
         x_from_left = (left_l**2 - right_l**2 + W**2) / (2.0 * W)
         y_sq        = left_l**2 - x_from_left**2
@@ -140,15 +110,16 @@ class PolarDrawingKinematics:
         world_x     = x_from_left - W / 2.0
         return world_x - self.draw_origin_wx, world_y - self.draw_origin_wy
 
-    # ── Klipper kinematics interface ──────────────────────────────────────────
+    # ── Klipper interface ─────────────────────────────────────────────────────
 
     def get_steppers(self):
         return [s for rail in self.rails for s in rail.get_steppers()]
 
     def calc_position(self, stepper_positions):
         """
-        Called by Klipper to compute toolhead XYZ from stepper positions.
-        Stepper positions are belt lengths in mm.
+        Klipper calls this with stepper positions.
+        stepper_left  position[0] = left belt length (mm)
+        stepper_right position[1] = right belt length (mm)
         """
         left_l  = stepper_positions[self.rails[0].get_name()]
         right_l = stepper_positions[self.rails[1].get_name()]
@@ -157,11 +128,22 @@ class PolarDrawingKinematics:
 
     def set_position(self, newpos, homing_axes):
         """
-        Called by Klipper to force a known position (drawing coordinates).
-        Converts to belt lengths and sets each stepper directly.
+        Klipper calls this with [x, y, z, e] in BELT-LENGTH space during
+        homing moves (forcepos/homepos), and in DRAWING space after homing.
+
+        During homing: newpos[0]=left_belt, newpos[1]=right_belt
+        After homing:  we call toolhead.set_position with drawing coords,
+                       which calls back here -- so we must handle both cases.
+
+        We detect which space we're in by checking is_homing.
         """
-        dx, dy          = newpos[0], newpos[1]
-        left_l, right_l = self._xy_to_belts(dx, dy)
+        if self.is_homing:
+            # newpos is belt lengths -- set steppers directly
+            left_l  = newpos[0]
+            right_l = newpos[1]
+        else:
+            # newpos is drawing coordinates -- convert to belt lengths
+            left_l, right_l = self._xy_to_belts(newpos[0], newpos[1])
         for s in self.rails[0].get_steppers():
             s.set_position([left_l,  0., 0.])
         for s in self.rails[1].get_steppers():
@@ -171,28 +153,21 @@ class PolarDrawingKinematics:
         """
         Home both motors simultaneously.
 
-        Stepper position = belt length in mm.
-        forcepos = position_min (short belt, gondola high, counterweight low)
-        homepos  = position_endstop = hypotenuse_home (longer belt,
-                   gondola lower, counterweight UP to MAX endstop)
+        forcepos and homepos are in BELT-LENGTH space:
+          forcepos = [position_min, position_min, 0, 0]
+          homepos  = [hypotenuse_home, hypotenuse_home, 0, 0]
 
-        homing_positive_dir: true in config drives from forcepos to homepos
-        (increasing belt length = counterweight rises).
-
-        homing_retract_dist: 0 in config disables Klipper's built-in retract,
-        which does not work correctly for polargraph geometry.
-        The G28 macro handles moving away from the endstop after homing.
+        The C solver moves each stepper linearly from forcepos to homepos.
+        stepper_left  moves position[0]: pos_min -> hypotenuse_home
+        stepper_right moves position[1]: pos_min -> hypotenuse_home
+        Both belts get longer -> both counterweights rise -> endstops trigger.
         """
         self.is_homing = True
-
         axes = [a for a in homing_state.get_axes() if a < len(self.rails)]
         if axes:
-            hi      = self.rails[0].get_homing_info()
             pos_min = self.rails[0].get_range()[0]
-            pos_end = hi.position_endstop
+            pos_end = self.rails[0].get_homing_info().position_endstop
 
-            # Both rails in a single home_rails call = simultaneous homing.
-            # forcepos[0] = left belt start, forcepos[1] = right belt start.
             forcepos = [pos_min, pos_min, 0., 0.]
             homepos  = [pos_end, pos_end, 0., 0.]
 
@@ -201,21 +176,18 @@ class PolarDrawingKinematics:
 
         self.is_homing = False
 
-        # Override toolhead position to drawing coordinates.
-        # Without this Klipper would report belt-length coordinates.
+        # Now set toolhead to drawing coordinates
         toolhead = self.printer.lookup_object('toolhead')
         toolhead.set_position(
             [self.homed_drawing_x, self.homed_drawing_y, 0., 0.],
             homing_axes='xy')
-        logging.info(
-            "PolarDrawing: homing complete, drawing pos=(%.2f, %.2f)",
-            self.homed_drawing_x, self.homed_drawing_y)
+        logging.info("PolarDrawing: homing done, drawing pos=(%.2f, %.2f)",
+                     self.homed_drawing_x, self.homed_drawing_y)
 
     def clear_homing_state(self, clear_axes):
         pass
 
     def check_move(self, move):
-        """Reject moves outside the drawing area (not checked during homing)."""
         if self.is_homing:
             return
         dx, dy = move.end_pos[0], move.end_pos[1]
@@ -227,7 +199,6 @@ class PolarDrawingKinematics:
                 % (dx, dy, self.draw_width, self.draw_height))
 
     def get_status(self, eventtime):
-        """Expose machine state to macros via printer['polardrawing']."""
         return {
             'homed_axes':          'xy',
             'axis_minimum':        self.axes_min,
@@ -248,5 +219,4 @@ class PolarDrawingKinematics:
 
 
 def load_kinematics(toolhead, config):
-    """Entry point called by Klipper when 'kinematics: polardrawing' is set."""
     return PolarDrawingKinematics(toolhead, config.getsection('polardrawing'))
