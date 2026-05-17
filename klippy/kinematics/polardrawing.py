@@ -115,24 +115,26 @@ class PolarDrawingKinematics:
         self.homed_drawing_x =  0.0              - self.draw_origin_wx
         self.homed_drawing_y =  self.home_y_world - self.draw_origin_wy
 
-        # ── Load belt steppers ────────────────────────────────────────────────
-        # Klipper v0.13+ API:
-        #   - setup_itersolve connects the stepper to the C iterative solver
-        #     'cartesian_stepper_alloc' with axis 'x' or 'y' gives a linear
-        #     stepper that moves proportionally -- we override calc_position
-        #     and set_position so the axis letter doesn't matter functionally,
-        #     but a valid solver must be provided.
-        #   - set_trapq connects the stepper to the toolhead motion queue.
-        #   - register_step_generator was removed in v0.13; set_trapq replaces it.
+        # ── Load belt steppers as Rails ───────────────────────────────────────
+        # PrinterRail (not PrinterStepper) is required because:
+        #   - It handles endstop_pin, position_min/max/endstop in the config
+        #   - It provides get_homing_info() needed by the homing system
+        #   - It supports homing_positive_dir
+        # Each rail drives one belt. We use the cartesian itersolve solver
+        # since our inverse kinematics is handled entirely in Python
+        # (calc_position / set_position / _xy_to_belts).
 
-        self.steppers = []
+        self.rails = []
         trapq = toolhead.get_trapq()
         for name, axis in [('stepper_left', b'x'), ('stepper_right', b'y')]:
-            s = stepper.PrinterStepper(config.getsection(name),
-                                       units_in_radians=False)
-            s.setup_itersolve('cartesian_stepper_alloc', axis)
-            s.set_trapq(trapq)
-            self.steppers.append(s)
+            rail = stepper.PrinterRail(config.getsection(name))
+            rail.setup_itersolve('cartesian_stepper_alloc', axis)
+            rail.set_trapq(trapq)
+            self.rails.append(rail)
+
+        # self.steppers: flat list of all MCU stepper objects across all rails
+        # (each rail may have multiple steppers in multi-motor setups)
+        self.steppers = [s for rail in self.rails for s in rail.get_steppers()]
 
         # ── Pen changer placeholder ───────────────────────────────────────────
         self._init_pen_changer(config)
@@ -240,35 +242,31 @@ class PolarDrawingKinematics:
 
     def calc_position(self, stepper_positions):
         """Compute toolhead XYZ from current stepper belt lengths."""
-        dx, dy = self._belts_to_xy(
-            stepper_positions['stepper_left'],
-            stepper_positions['stepper_right'],
-        )
+        left_len  = stepper_positions[self.rails[0].get_name()]
+        right_len = stepper_positions[self.rails[1].get_name()]
+        dx, dy = self._belts_to_xy(left_len, right_len)
         return [dx, dy, 0.0]
 
     def set_position(self, newpos, homing_axes):
         """Force a known position -- convert drawing XY to belt lengths."""
         left_len, right_len = self._xy_to_belts(newpos[0], newpos[1])
-        self.steppers[0].set_position([left_len,  0.0, 0.0])
-        self.steppers[1].set_position([right_len, 0.0, 0.0])
+        self.rails[0].set_position([left_len,  0.0, 0.0])
+        self.rails[1].set_position([right_len, 0.0, 0.0])
 
     def home(self, homing_state):
         """
         Homing sequence:
-          1. Both motors drive toward shorter belt (homing_positive_dir: false).
-             This raises the gondola and lifts both counterweights.
-          2. Both MAX endstops trigger simultaneously.
-             Belt = hypotenuse_home at that moment.
-          3. Compute drawing coordinates of that known world position
-             and register it with Klipper's toolhead.
-          4. Machine is now ready -- G0 X0 Y0 moves to drawing top-left corner.
+          1. Both rails home simultaneously toward their endstops.
+             homing_positive_dir: false drives toward shorter belt
+             (gondola rises, counterweights go up, hit MAX endstops).
+          2. Klipper latches belt length at endstop = position_endstop.
+          3. We set the toolhead drawing position from the known geometry.
+          4. G0 X0 Y0 then moves gondola to drawing top-left corner.
         """
-        homing_state.home_axes(
-            self.steppers,
-            axes=[0, 1],
-            forcepos=None,
-            speed=self.homing_speed,
-        )
+        # home_rails drives both rails to their endstops using
+        # homing_positive_dir and position_endstop from the config
+        forcepos = list(self._get_home_position())
+        homing_state.home_rails(self.rails, forcepos, self._get_home_position())
         # Tell Klipper where the gondola is in drawing coordinates
         toolhead = self.printer.lookup_object('toolhead')
         toolhead.set_position(
@@ -279,6 +277,17 @@ class PolarDrawingKinematics:
             "PolarDrawing: homing complete -- gondola at drawing (%.2f, %.2f)",
             self.homed_drawing_x, self.homed_drawing_y
         )
+
+    def _get_home_position(self):
+        """Return the toolhead position to force during homing approach."""
+        # For homing_positive_dir: false, forcepos should be beyond position_max
+        # so the homing move drives in the negative direction (toward endstop)
+        return [self.homed_drawing_x, self.homed_drawing_y, 0.0]
+
+    def clear_homing_state(self, clear_axes):
+        """Called by Klipper to reset homing state on specified axes."""
+        # Nothing to reset -- homing state is managed by the rails
+        pass
 
     def check_move(self, move):
         """Reject moves outside drawing area or beyond belt length limits."""
