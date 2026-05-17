@@ -68,8 +68,8 @@ class PolarDrawingKinematics:
             stepper.LookupMultiRail(config.getsection('stepper_left')),
             stepper.LookupMultiRail(config.getsection('stepper_right')),
         ]
-        for rail in self.rails:
-            rail.setup_itersolve('cartesian_stepper_alloc', b'x')
+        for rail, axis in zip(self.rails, [b'x', b'y']):
+            rail.setup_itersolve('cartesian_stepper_alloc', axis)
         for s in self.get_steppers():
             s.set_trapq(toolhead.get_trapq())
 
