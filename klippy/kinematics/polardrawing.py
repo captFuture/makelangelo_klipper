@@ -261,22 +261,27 @@ class PolarDrawingKinematics:
           4. G0 X0 Y0 moves gondola to top-left corner of paper.
         """
         self.is_homing = True
-        for axis in homing_state.get_axes():
-            if axis >= len(self.rails):
-                continue
-            rail = self.rails[axis]
-            hi   = rail.get_homing_info()
-            position_min, position_max = rail.get_range()
+        # Home both rails simultaneously -- critical for polargraph:
+        # sequential homing causes one counterweight to hit its endstop
+        # while the other is still moving, leading to skipping and chaos.
+        axes = [a for a in homing_state.get_axes() if a < len(self.rails)]
+        if axes:
             homepos  = [None, None, None, None]
             forcepos = [None, None, None, None]
-            homepos[axis] = hi.position_endstop
-            if hi.positive_dir:
-                forcepos[axis] = (hi.position_endstop
-                                  - 1.5 * (hi.position_endstop - position_min))
-            else:
-                forcepos[axis] = (hi.position_endstop
-                                  + 1.5 * (position_max - hi.position_endstop))
-            homing_state.home_rails([rail], forcepos, homepos)
+            for axis in axes:
+                rail = self.rails[axis]
+                hi   = rail.get_homing_info()
+                position_min, position_max = rail.get_range()
+                homepos[axis] = hi.position_endstop
+                if hi.positive_dir:
+                    forcepos[axis] = (hi.position_endstop
+                                      - 1.5 * (hi.position_endstop - position_min))
+                else:
+                    forcepos[axis] = (hi.position_endstop
+                                      + 1.5 * (position_max - hi.position_endstop))
+            # Single call with both rails = simultaneous homing move
+            homing_state.home_rails(
+                [self.rails[a] for a in axes], forcepos, homepos)
 
         self.is_homing = False
         # Override toolhead to drawing coordinates after homing.
