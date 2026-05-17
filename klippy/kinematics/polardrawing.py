@@ -111,6 +111,7 @@ class PolarDrawingKinematics:
 
         # Homing limits -- (1.0, -1.0) means not yet homed
         self.limits = [(1.0, -1.0), (1.0, -1.0)]
+        self.is_homing = False
 
         # ── Drawing area for Mainsail display ─────────────────────────────────
         self.axes_min = toolhead.Coord([0., 0., 0., 0.])
@@ -209,23 +210,17 @@ class PolarDrawingKinematics:
     def home(self, homing_state):
         """
         Home both belt motors simultaneously.
-
-        Both rails drive toward shorter belt (homing_positive_dir: false).
-        Counterweights rise and hit their MAX endstops simultaneously.
+        Counterweights rise and hit MAX endstops.
         Belt length at endstop = position_endstop = hypotenuse_home.
-
-        After homing, set_position() is called by Klipper with the homed
-        position from calc_position(). We then override the toolhead position
-        to drawing coordinates in the G28 macro (GO_HOME after homing).
+        After homing we explicitly set the toolhead to drawing coordinates
+        so subsequent G-code sees (homed_drawing_x, homed_drawing_y).
         """
+        self.is_homing = True
         for axis in homing_state.get_axes():
+            if axis >= len(self.rails):
+                continue
             rail = self.rails[axis]
             hi   = rail.get_homing_info()
-
-            # forcepos: where to force the toolhead before the homing move.
-            # For homing_positive_dir: false (drive toward negative / shorter
-            # belt), forcepos must be ABOVE position_endstop so the move
-            # goes downward toward the endstop.
             position_min, position_max = rail.get_range()
             homepos  = [None, None, None, None]
             forcepos = [None, None, None, None]
@@ -236,8 +231,20 @@ class PolarDrawingKinematics:
             else:
                 forcepos[axis] = (hi.position_endstop
                                   + 1.5 * (position_max - hi.position_endstop))
-
             homing_state.home_rails([rail], forcepos, homepos)
+
+        self.is_homing = False
+        # Klipper has set the toolhead to belt coordinates after homing.
+        # Override to drawing coordinates so all subsequent moves work correctly.
+        toolhead = self.printer.lookup_object('toolhead')
+        toolhead.set_position(
+            [self.homed_drawing_x, self.homed_drawing_y, 0., 0.],
+            homing_axes='xy'
+        )
+        logging.info(
+            "PolarDrawing: homing complete -- gondola at drawing (%.2f, %.2f)",
+            self.homed_drawing_x, self.homed_drawing_y
+        )
 
     def clear_homing_state(self, clear_axes):
         for axis, axis_name in enumerate('xy'):
@@ -246,10 +253,8 @@ class PolarDrawingKinematics:
 
     def check_move(self, move):
         """Reject moves outside drawing area or beyond belt length limits."""
-        # Skip bounds check if not yet homed -- homing moves use raw belt
-        # coordinates which are outside the drawing area by definition.
-        if self.limits[0][0] > self.limits[0][1]:
-            return  # not homed, allow all moves
+        if self.is_homing or self.limits[0][0] > self.limits[0][1]:
+            return  # homing in progress or not yet homed -- allow all moves
 
         dx, dy = move.end_pos[0], move.end_pos[1]
 
