@@ -1,21 +1,22 @@
 # Polar Drawing Machine Kinematics for Klipper
 # Repository: https://github.com/captFuture/makelangelo_klipper
 #
-# Architecture:
-#   stepper_left  uses cartesian_stepper_alloc('x') -- position[0] = left belt mm
-#   stepper_right uses cartesian_stepper_alloc('y') -- position[1] = right belt mm
+# Based on winch.py pattern -- each motor is a cable winch at a fixed anchor.
+# winch_stepper_alloc(ax, ay, az) computes belt length as Euclidean distance
+# from anchor to toolhead position -- exactly the polargraph belt formula.
 #
-#   The C solver moves steppers linearly in their axis.
-#   set_position() receives drawing coords and converts to belt lengths.
-#   calc_position() receives belt lengths and converts to drawing coords.
-#   home_rails() forcepos/homepos must be in belt-length space:
-#     [left_belt, right_belt, 0, 0]
+# Coordinate system (DRAWING space = toolhead space):
+#   Origin (0,0): draw_margin_left mm right of left motor,
+#                 draw_margin_top  mm below motor axis
+#   X increases right, Y increases down
+#   Motor anchors in drawing space:
+#     left:  (-draw_margin_left,  -draw_margin_top, 0)
+#     right: (motor_distance - draw_margin_left, -draw_margin_top, 0)
 #
 # Homing:
-#   forcepos = [position_min, position_min, 0, 0]  (short belts)
-#   homepos  = [position_endstop, position_endstop, 0, 0]  (hypotenuse_home)
-#   homing_positive_dir: true -- drives from short to long belt
-#   Longer belt = gondola down = counterweight UP to MAX endstop
+#   Both endstops are wired as MCU endstops and registered manually.
+#   Home sequence drives both motors until both endstops trigger.
+#   After homing, gondola is at drawing position (homed_drawing_x, homed_drawing_y).
 #
 # Pen changer: placeholder for future carousel hardware.
 
@@ -29,10 +30,10 @@ class PolarDrawingKinematics:
         self.printer = config.get_printer()
 
         # ── Machine dimensions ────────────────────────────────────────────────
-        self.motor_distance  = config.getfloat('motor_distance', above=0.)
-        self.hypotenuse_home = config.getfloat('hypotenuse_length_at_home', 1035.0)
-        self.max_belt_length = config.getfloat('max_belt_length', 1400.0)
-        self.min_belt_length = config.getfloat('min_belt_length', 100.0)
+        self.motor_distance   = config.getfloat('motor_distance', above=0.)
+        self.hypotenuse_home  = config.getfloat('hypotenuse_length_at_home', 1035.0)
+        self.max_belt_length  = config.getfloat('max_belt_length', 1400.0)
+        self.min_belt_length  = config.getfloat('min_belt_length', 100.0)
         self.draw_margin_left = config.getfloat('draw_margin_left', 115.0)
         self.draw_margin_top  = config.getfloat('draw_margin_top',  115.0)
         self.draw_width       = config.getfloat('draw_width',  594.0)
@@ -41,39 +42,69 @@ class PolarDrawingKinematics:
 
         # ── Derived geometry ──────────────────────────────────────────────────
         half_w = self.motor_distance / 2.0
-        self.draw_origin_wx  = -half_w + self.draw_margin_left
-        self.draw_origin_wy  =  self.draw_margin_top
+
+        # Motor anchor positions in DRAWING coordinates
+        # left motor:  world (-half_w, 0) -> drawing (-half_w - draw_origin_wx, -draw_origin_wy)
+        #            = (-half_w - (-half_w + draw_margin_left), -draw_margin_top)
+        #            = (-draw_margin_left, -draw_margin_top)
+        self.anchor_left  = (-self.draw_margin_left,
+                              0.,
+                             -self.draw_margin_top)
+        self.anchor_right = (self.motor_distance - self.draw_margin_left,
+                              0.,
+                             -self.draw_margin_top)
+
+        # Gondola world-Y when both endstops trigger
         self.home_y_world    = math.sqrt(
             max(self.hypotenuse_home**2 - half_w**2, 0.0))
-        self.homed_drawing_x = 0.0              - self.draw_origin_wx
-        self.homed_drawing_y = self.home_y_world - self.draw_origin_wy
+        # Drawing origin in world: (-half_w + draw_margin_left, draw_margin_top)
+        draw_origin_wx = -half_w + self.draw_margin_left
+        draw_origin_wy =  self.draw_margin_top
+        # Gondola drawing position after homing (world X=0, world Y=home_y_world)
+        self.homed_drawing_x = 0.0             - draw_origin_wx
+        self.homed_drawing_y = self.home_y_world - draw_origin_wy
 
-        # ── Load rails ────────────────────────────────────────────────────────
-        # stepper_left  -> axis 'x' -> toolhead position[0] = left belt length
-        # stepper_right -> axis 'y' -> toolhead position[1] = right belt length
-        self.rails = [
-            stepper.LookupMultiRail(config.getsection('stepper_left')),
-            stepper.LookupMultiRail(config.getsection('stepper_right')),
-        ]
-        self.rails[0].setup_itersolve('cartesian_stepper_alloc', b'x')
-        self.rails[1].setup_itersolve('cartesian_stepper_alloc', b'y')
-        for s in self.get_steppers():
+        # ── Load steppers (winch.py pattern) ─────────────────────────────────
+        # PrinterStepper + winch_stepper_alloc: the C solver computes
+        # Euclidean distance from anchor to toolhead = belt length.
+        # Toolhead moves in drawing (XZ) plane; anchor_y=0 for both motors.
+        self.steppers = []
+        anchors = [self.anchor_left, self.anchor_right]
+        for name, anchor in zip(['stepper_left', 'stepper_right'], anchors):
+            s = stepper.PrinterStepper(config.getsection(name))
+            s.setup_itersolve('winch_stepper_alloc', *anchor)
             s.set_trapq(toolhead.get_trapq())
+            self.steppers.append(s)
 
-        self.is_homing = False
+        # ── Endstops ──────────────────────────────────────────────────────────
+        # Register endstop pins manually -- PrinterStepper doesn't handle them.
+        ppins = self.printer.lookup_object('pins')
+        self.endstops = []
+        for i, name in enumerate(['stepper_left', 'stepper_right']):
+            sc  = config.getsection(name)
+            pin = sc.get('endstop_pin')
+            mcu_es = ppins.setup_pin('endstop', pin)
+            mcu_es.add_stepper(self.steppers[i])
+            self.endstops.append((mcu_es, name))
+
+        # Homing info from stepper configs
+        self.homing_speed_cfg = config.getfloat('homing_speed', 50.0)
+
+        # ── Drawing area for Mainsail ─────────────────────────────────────────
         self.axes_min = toolhead.Coord([0., 0., 0., 0.])
         self.axes_max = toolhead.Coord([self.draw_width, self.draw_height, 0., 0.])
 
+        # ── Pen changer placeholder ───────────────────────────────────────────
         self._init_pen_changer(config)
         self.printer.add_object('polardrawing', self)
 
         logging.info(
             "PolarDrawing: motor_distance=%.1f  hypotenuse_home=%.1f  "
             "home_y_world=%.1f  homed_drawing=(%.1f, %.1f)  "
-            "draw_area=%.0fx%.0f mm",
+            "anchors: left=%s  right=%s",
             self.motor_distance, self.hypotenuse_home,
             self.home_y_world, self.homed_drawing_x, self.homed_drawing_y,
-            self.draw_width, self.draw_height)
+            self.anchor_left, self.anchor_right)
 
     # ── Pen changer placeholder ───────────────────────────────────────────────
 
@@ -90,97 +121,93 @@ class PolarDrawingKinematics:
                      self.current_pen, target_pen)
         self.current_pen = target_pen
 
-    # ── Kinematics math ───────────────────────────────────────────────────────
-
-    def _xy_to_belts(self, dx, dy):
-        """Drawing coords -> (left_belt_mm, right_belt_mm)."""
-        wx      = self.draw_origin_wx + dx
-        wy      = self.draw_origin_wy + dy
-        half_w  = self.motor_distance / 2.0
-        left_l  = math.sqrt((wx + half_w)**2 + wy**2)
-        right_l = math.sqrt((wx - half_w)**2 + wy**2)
-        return left_l, right_l
-
-    def _belts_to_xy(self, left_l, right_l):
-        """(left_belt_mm, right_belt_mm) -> drawing coords."""
-        W           = self.motor_distance
-        x_from_left = (left_l**2 - right_l**2 + W**2) / (2.0 * W)
-        y_sq        = left_l**2 - x_from_left**2
-        world_y     = math.sqrt(max(y_sq, 0.0))
-        world_x     = x_from_left - W / 2.0
-        return world_x - self.draw_origin_wx, world_y - self.draw_origin_wy
-
     # ── Klipper interface ─────────────────────────────────────────────────────
 
     def get_steppers(self):
-        return [s for rail in self.rails for s in rail.get_steppers()]
+        return list(self.steppers)
 
     def calc_position(self, stepper_positions):
         """
-        Klipper calls this with stepper positions.
-        stepper_left  position[0] = left belt length (mm)
-        stepper_right position[1] = right belt length (mm)
+        Forward kinematics: belt lengths -> drawing XY.
+        The winch solver stores belt lengths in stepper_positions.
+        We triangulate to find gondola position.
         """
-        left_l  = stepper_positions[self.rails[0].get_name()]
-        right_l = stepper_positions[self.rails[1].get_name()]
-        dx, dy  = self._belts_to_xy(left_l, right_l)
-        return [dx, dy, 0.0]
+        left_l  = stepper_positions['stepper_left']
+        right_l = stepper_positions['stepper_right']
+        W = self.motor_distance
+        # Triangulation (law of cosines)
+        # Anchors are at drawing X = -draw_margin_left and X = motor_distance - draw_margin_left
+        # Distance between anchors in X = motor_distance
+        ax_l = self.anchor_left[0]   # = -draw_margin_left
+        ax_r = self.anchor_right[0]  # = motor_distance - draw_margin_left
+        az   = self.anchor_left[2]   # = -draw_margin_top (same for both)
+        # Solve for gondola (dx, dz) in drawing space
+        # left_l^2  = (dx - ax_l)^2 + dz^2  ... wait, anchors use (x,y,z) but gondola is 2D
+        # winch uses distance in 3D: sqrt((gx-ax)^2 + (gy-ay)^2 + (gz-az)^2)
+        # gondola y=0 always, anchor y=0 always, so:
+        # left_l^2  = (dx - ax_l)^2 + (dz - az)^2
+        # right_l^2 = (dx - ax_r)^2 + (dz - az)^2
+        # Subtract: left_l^2 - right_l^2 = (dx-ax_l)^2 - (dx-ax_r)^2
+        #         = dx^2 - 2*dx*ax_l + ax_l^2 - dx^2 + 2*dx*ax_r - ax_r^2
+        #         = 2*dx*(ax_r - ax_l) + ax_l^2 - ax_r^2
+        #         = 2*dx*W + ax_l^2 - ax_r^2
+        # dx = (left_l^2 - right_l^2 - ax_l^2 + ax_r^2) / (2*W)
+        dx = (left_l**2 - right_l**2 - ax_l**2 + ax_r**2) / (2.0 * W)
+        dz_sq = left_l**2 - (dx - ax_l)**2
+        dz = math.sqrt(max(dz_sq, 0.0)) + az  # az is negative, so dz = drawing Y
+        return [dx, dz, 0.0]
 
     def set_position(self, newpos, homing_axes):
         """
-        Klipper calls this with [x, y, z, e] in BELT-LENGTH space during
-        homing moves (forcepos/homepos), and in DRAWING space after homing.
-
-        During homing: newpos[0]=left_belt, newpos[1]=right_belt
-        After homing:  we call toolhead.set_position with drawing coords,
-                       which calls back here -- so we must handle both cases.
-
-        We detect which space we're in by checking is_homing.
+        Klipper calls this to force a known position.
+        newpos is in drawing coordinates [dx, dy, dz, e].
+        The winch solver computes belt lengths from anchor to newpos automatically
+        when we call set_position on the stepper with the drawing position.
         """
-        if self.is_homing:
-            # newpos is belt lengths -- set steppers directly
-            left_l  = newpos[0]
-            right_l = newpos[1]
-        else:
-            # newpos is drawing coordinates -- convert to belt lengths
-            left_l, right_l = self._xy_to_belts(newpos[0], newpos[1])
-        for s in self.rails[0].get_steppers():
-            s.set_position([left_l,  0., 0.])
-        for s in self.rails[1].get_steppers():
-            s.set_position([right_l, 0., 0.])
+        for s in self.steppers:
+            s.set_position(newpos)
 
     def home(self, homing_state):
         """
-        Home both motors simultaneously.
-
-        forcepos and homepos are in BELT-LENGTH space:
-          forcepos = [position_min, position_min, 0, 0]
-          homepos  = [hypotenuse_home, hypotenuse_home, 0, 0]
-
-        The C solver moves each stepper linearly from forcepos to homepos.
-        stepper_left  moves position[0]: pos_min -> hypotenuse_home
-        stepper_right moves position[1]: pos_min -> hypotenuse_home
-        Both belts get longer -> both counterweights rise -> endstops trigger.
+        Homing using the winch.py / manual endstop pattern.
+        Both motors drive simultaneously until both endstops trigger.
+        Then we set the known homed position in drawing coordinates.
         """
-        self.is_homing = True
-        axes = [a for a in homing_state.get_axes() if a < len(self.rails)]
-        if axes:
-            pos_min = self.rails[0].get_range()[0]
-            pos_end = self.rails[0].get_homing_info().position_endstop
+        # Tell homing system which axes we are homing
+        homing_state.set_axes([0, 1])
 
-            forcepos = [pos_min, pos_min, 0., 0.]
-            homepos  = [pos_end, pos_end, 0., 0.]
-
-            homing_state.home_rails(
-                [self.rails[a] for a in axes], forcepos, homepos)
-
-        self.is_homing = False
-
-        # Now set toolhead to drawing coordinates
+        # Drive both steppers toward endstops simultaneously
+        # We use the Homing object directly like winch.py does
+        from extras import homing as homing_mod
         toolhead = self.printer.lookup_object('toolhead')
-        toolhead.set_position(
-            [self.homed_drawing_x, self.homed_drawing_y, 0., 0.],
-            homing_axes='xy')
+
+        # Force current position to a point far from endstop
+        # so the homing move has room to travel
+        # In drawing space, move to a position where belts are short
+        # (gondola high = belts short = far from MAX endstop)
+        # We use the homed position itself as the target (homepos)
+        # and force a start below it
+        curpos = list(toolhead.get_position())
+        # Force position to drawing coords of short belt (gondola low = long belt)
+        # We just need the homing move to go in the right direction
+        # Start: gondola at bottom (long belts), End: gondola at home (shorter belts)
+        # But our endstops trigger at LONG belt (counterweight UP = gondola DOWN)
+        # So homepos = homed_drawing position, forcepos = somewhere below it
+
+        # Use HomingMove directly
+        hmove = homing_mod.HomingMove(self.printer, self.endstops)
+        # Move to homed drawing position -- endstops will stop it
+        homepos = [self.homed_drawing_x, self.homed_drawing_y, 0., 0.]
+        # Forcepos: start from a position below home (larger Y = longer belts)
+        forcepos = [self.homed_drawing_x,
+                    self.homed_drawing_y + self.draw_height,
+                    0., 0.]
+        toolhead.set_position(forcepos)
+        hmove.homing_move(homepos, self.homing_speed)
+
+        # Set homed position
+        homing_state.set_homed_position(
+            [self.homed_drawing_x, self.homed_drawing_y, 0.])
         logging.info("PolarDrawing: homing done, drawing pos=(%.2f, %.2f)",
                      self.homed_drawing_x, self.homed_drawing_y)
 
@@ -188,8 +215,6 @@ class PolarDrawingKinematics:
         pass
 
     def check_move(self, move):
-        if self.is_homing:
-            return
         dx, dy = move.end_pos[0], move.end_pos[1]
         if (dx < 0. or dx > self.draw_width or
                 dy < 0. or dy > self.draw_height):
@@ -206,8 +231,8 @@ class PolarDrawingKinematics:
             'motor_distance':      self.motor_distance,
             'hypotenuse_home':     self.hypotenuse_home,
             'home_y_world':        self.home_y_world,
-            'draw_origin_wx':      self.draw_origin_wx,
-            'draw_origin_wy':      self.draw_origin_wy,
+            'draw_origin_wx':      self.anchor_left[0],
+            'draw_origin_wy':      -self.anchor_left[2],
             'homed_drawing_x':     self.homed_drawing_x,
             'homed_drawing_y':     self.homed_drawing_y,
             'draw_width':          self.draw_width,
@@ -219,4 +244,5 @@ class PolarDrawingKinematics:
 
 
 def load_kinematics(toolhead, config):
+    return PolarDrawingKinematics(toolhead, config.getsection('polardrawing'))
     return PolarDrawingKinematics(toolhead, config.getsection('polardrawing'))
