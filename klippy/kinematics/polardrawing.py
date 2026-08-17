@@ -9,14 +9,14 @@ class PolarDrawingKinematics:
     def __init__(self, toolhead, config):
         self.printer = config.get_printer()
 
-        self.motor_distance   = config.getfloat('motor_distance', above=0.)
-        self.hypotenuse_home  = config.getfloat('hypotenuse_length_at_home', 1060.0)
+        self.motor_distance   = config.getfloat('motor_distance', 640)
+        self.hypotenuse_home  = config.getfloat('hypotenuse_length_at_home', 1043.7)
         self.max_belt_length  = config.getfloat('max_belt_length', 1450.0)
         self.min_belt_length  = config.getfloat('min_belt_length', 100.0)
-        self.draw_margin_left = config.getfloat('draw_margin_left', 115.0)
-        self.draw_margin_top  = config.getfloat('draw_margin_top',  150.0)
-        self.draw_width       = config.getfloat('draw_width',  420.0)
-        self.draw_height      = config.getfloat('draw_height', 594.0)
+        self.draw_margin_left = config.getfloat('draw_margin_left', 70.0)
+        self.draw_margin_top  = config.getfloat('draw_margin_top',  160.0)
+        self.draw_width       = config.getfloat('draw_width',  500.0)
+        self.draw_height      = config.getfloat('draw_height', 700.0)
         self.homing_speed     = config.getfloat('homing_speed', 50.0)
 
         half_w = self.motor_distance / 2.0
