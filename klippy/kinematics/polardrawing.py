@@ -1,9 +1,11 @@
-# Polar Drawing Machine Kinematics for Klipper
+# polardrawing.py -- Polar Drawing Machine Kinematics for Klipper
 # Repository: https://github.com/captFuture/makelangelo_klipper
 
 import math
 import logging
 import stepper
+
+HOMING_OVERTRAVEL = 400.0
 
 class PolarDrawingKinematics:
     def __init__(self, toolhead, config):
@@ -21,7 +23,7 @@ class PolarDrawingKinematics:
 
         half_w = self.motor_distance / 2.0
 
-        # FIX: Ankerpunkte strikt auf die 2D-Fläche (Z=0) gezwungen!
+        # Anchor points are forced strictly onto the 2D plane (Z=0).
         self.anchor_left  = (-self.draw_margin_left, -self.draw_margin_top, 0.)
         self.anchor_right = (self.motor_distance - self.draw_margin_left, -self.draw_margin_top, 0.)
 
@@ -29,7 +31,7 @@ class PolarDrawingKinematics:
             max(self.hypotenuse_home**2 - half_w**2, 0.0))
         draw_origin_wx = -half_w + self.draw_margin_left
         draw_origin_wy =  self.draw_margin_top
-        
+
         self.homed_drawing_x = 0.0              - draw_origin_wx
         self.homed_drawing_y = self.home_y_world - draw_origin_wy
 
@@ -56,7 +58,7 @@ class PolarDrawingKinematics:
         limit_x_max = self.motor_distance + 100.0
         limit_y_min = -self.draw_margin_top - 10.0
         limit_y_max = self.homed_drawing_y + 50.0
-        
+
         self.axes_min = toolhead.Coord([limit_x_min, limit_y_min, 0., 0.])
         self.axes_max = toolhead.Coord([limit_x_max, limit_y_max, 0., 0.])
 
@@ -78,14 +80,14 @@ class PolarDrawingKinematics:
         left_l  = stepper_positions['stepper_left']
         right_l = stepper_positions['stepper_right']
         W = self.motor_distance
-        
+
         ax_l = self.anchor_left[0]
         ax_r = self.anchor_right[0]
-        ay   = self.anchor_left[1] # FIX: Y-Achse korrekt mappen
-        
+        ay   = self.anchor_left[1]  # both anchors share the same Y
+
         dx = (left_l**2 - right_l**2 - ax_l**2 + ax_r**2) / (2.0 * W)
-        
-        # FIX: Saubere 2D Pythagoras Berechnung für die vertikale Achse
+
+        # Plain 2D Pythagoras for the vertical component.
         dy_sq = left_l**2 - (dx - ax_l)**2
         dy = math.sqrt(max(dy_sq, 0.0)) + ay
         return [dx, dy, 0.0]
@@ -101,14 +103,18 @@ class PolarDrawingKinematics:
         toolhead = self.printer.lookup_object('toolhead')
 
         hmove = homing_mod.HomingMove(self.printer, self.endstops)
-        
-        fake_target = [self.homed_drawing_x, self.homed_drawing_y + 2000.0, 0., 0.]
-        
+
+        # Homing direction: gondola DOWN => belts LONGER => counterweights
+        # UP => endstops trigger. hypotenuse_length_at_home is therefore
+        # the MAXIMUM belt length (at the endstop), not the minimum.
+        fake_target = [self.homed_drawing_x,
+                       self.homed_drawing_y + HOMING_OVERTRAVEL, 0., 0.]
+
         forcepos = [self.homed_drawing_x,
                     -self.draw_margin_top + 1.0,
                     0., 0.]
         toolhead.set_position(forcepos)
-        
+
         hmove.homing_move(fake_target, self.homing_speed)
 
         homing_state.set_homed_position(
@@ -123,7 +129,28 @@ class PolarDrawingKinematics:
         dx, dy = move.end_pos[0], move.end_pos[1]
         if dy < -self.draw_margin_top:
             raise move.move_error(
-                "PolarDrawing: Target Y (%.2f) is above the motors. Move denied." % dy)
+                "PolarDrawing: target Y (%.2f) is above the motors. Move denied." % dy)
+
+        # Enforce the configured belt-length safety range. Only checked at
+        # the move's end position (not continuously along the path), but
+        # this is still real protection where previously min_belt_length /
+        # max_belt_length were read from config and never used.
+        ax_l, ay_l = self.anchor_left[0], self.anchor_left[1]
+        ax_r, ay_r = self.anchor_right[0], self.anchor_right[1]
+        left_len  = math.hypot(dx - ax_l, dy - ay_l)
+        right_len = math.hypot(dx - ax_r, dy - ay_r)
+
+        if left_len < self.min_belt_length or right_len < self.min_belt_length:
+            raise move.move_error(
+                "PolarDrawing: target (%.2f, %.2f) would require a belt shorter "
+                "than min_belt_length (%.1f mm). Move denied."
+                % (dx, dy, self.min_belt_length))
+
+        if left_len > self.max_belt_length or right_len > self.max_belt_length:
+            raise move.move_error(
+                "PolarDrawing: target (%.2f, %.2f) would require a belt longer "
+                "than max_belt_length (%.1f mm). Move denied."
+                % (dx, dy, self.max_belt_length))
 
     def get_status(self, eventtime):
         return {
